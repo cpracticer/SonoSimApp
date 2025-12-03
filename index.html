@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WLE Nonlinear Acoustic Simulator</title>
+    
+    <!-- 1. 引入 React 和 ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- 2. 引入 Babel 用于解析 JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- 3. 引入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <style>
+        body { font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f8fafc; }
+        canvas { touch-action: none; } /* 防止手机上触摸滚动 */
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- 图标组件定义 (SVG) ---
+        const IconBase = ({ children, size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                {children}
+            </svg>
+        );
+
+        const Play = (props) => <IconBase {...props}><polygon points="5 3 19 12 5 21 5 3"></polygon></IconBase>;
+        const Pause = (props) => <IconBase {...props}><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></IconBase>;
+        const RefreshCw = (props) => <IconBase {...props}><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></IconBase>;
+        const Square = (props) => <IconBase {...props}><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></IconBase>;
+        const Zap = (props) => <IconBase {...props}><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></IconBase>;
+        const Activity = (props) => <IconBase {...props}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></IconBase>;
+        const Settings2 = (props) => <IconBase {...props}><line x1="17" y1="10" x2="3" y2="10"></line><line x1="21" y1="10" x2="19" y2="10"></line><line x1="17" y1="14" x2="3" y2="14"></line><line x1="21" y1="14" x2="19" y2="14"></line><line x1="13" y1="6" x2="3" y2="6"></line><line x1="21" y1="6" x2="15" y2="6"></line><line x1="13" y1="18" x2="3" y2="18"></line><line x1="21" y1="18" x2="15" y2="18"></line></IconBase>;
+        const Info = (props) => <IconBase {...props}><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></IconBase>;
+        const MousePointerClick = (props) => <IconBase {...props}><path d="M14 4.1 12 6"></path><path d="m5.1 8-2.9-.8"></path><path d="m6 12-1.9 2"></path><path d="M7.2 2.2 8 5.1"></path><path d="M9.037 9.69a.498.498 0 0 1 .653-.653l11 4.5a.5.5 0 0 1-.074.949l-4.349 1.041a1 1 0 0 0-.74.739l-1.04 4.35a.5.5 0 0 1-.95.074z"></path></IconBase>;
+
+        // --- 主逻辑代码 ---
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // 配置参数
+        const GRID_SIZE = 128; 
+        const CANVAS_SIZE = 512; 
+        const SCOPE_WIDTH = 256;
+        const SCOPE_HEIGHT = 150;
+        const DAMPING = 0.98;
+        const NONLINEAR_BETA = 0.8; 
+
+        const WLEVisualizer = () => {
+            const canvasRef = useRef(null);
+            const scopeRef = useRef(null);
+            const requestRef = useRef();
+            
+            const [isRunning, setIsRunning] = useState(true);
+            const [isNonLinear, setIsNonLinear] = useState(false);
+            const [autoSource, setAutoSource] = useState(true);
+            const [mode, setMode] = useState('source');
+            const [probePos, setProbePos] = useState({ x: GRID_SIZE/2 + 20, y: GRID_SIZE/2 });
+            
+            const uRef = useRef(new Float32Array(GRID_SIZE * GRID_SIZE));
+            const uPrevRef = useRef(new Float32Array(GRID_SIZE * GRID_SIZE));
+            const wallsRef = useRef(new Uint8Array(GRID_SIZE * GRID_SIZE));
+            const scopeDataRef = useRef(new Array(SCOPE_WIDTH).fill(0));
+
+            const autoSourceRef = useRef(autoSource);
+            useEffect(() => { autoSourceRef.current = autoSource; }, [autoSource]);
+
+            useEffect(() => {
+                resetSimulation();
+                return () => cancelAnimationFrame(requestRef.current);
+            }, []);
+
+            const resetSimulation = () => {
+                uRef.current.fill(0);
+                uPrevRef.current.fill(0);
+                wallsRef.current.fill(0);
+                scopeDataRef.current.fill(0);
+                drawDefaultSkull();
+                setProbePos({ x: GRID_SIZE/2 + 20, y: GRID_SIZE/2 });
+            };
+
+            const drawDefaultSkull = () => {
+                const cx = GRID_SIZE / 2;
+                const cy = GRID_SIZE / 2;
+                const radius = GRID_SIZE / 4;
+                for (let y = 0; y < GRID_SIZE; y++) {
+                    for (let x = 0; x < GRID_SIZE; x++) {
+                        const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
+                        if (dist > radius - 2 && dist < radius + 2 && (y > cy || x < cx)) {
+                            wallsRef.current[y * GRID_SIZE + x] = 1;
+                        }
+                    }
+                }
+            };
+
+            const step = () => {
+                const u = uRef.current;
+                const uPrev = uPrevRef.current;
+                const walls = wallsRef.current;
+                const nextU = new Float32Array(GRID_SIZE * GRID_SIZE);
+
+                if (autoSourceRef.current) {
+                    const sourceIdx = Math.floor((GRID_SIZE/2) * GRID_SIZE + 20);
+                    const time = Date.now() / 80;
+                    const sourceValue = Math.sin(time) * (isNonLinear ? 2.0 : 1.5); 
+                    u[sourceIdx] = sourceValue;
+                }
+
+                for (let y = 1; y < GRID_SIZE - 1; y++) {
+                    for (let x = 1; x < GRID_SIZE - 1; x++) {
+                        const i = y * GRID_SIZE + x;
+
+                        if (walls[i] === 1) {
+                            nextU[i] = 0; 
+                            continue;
+                        }
+
+                        const laplacian = 
+                            u[i - 1] + u[i + 1] + u[i - GRID_SIZE] + u[i + GRID_SIZE] - 4 * u[i];
+
+                        let c_squared = 0.20; 
+
+                        if (isNonLinear) {
+                            const nonlinear_factor = 1 + NONLINEAR_BETA * u[i];
+                            const safe_factor = Math.max(0.1, nonlinear_factor);
+                            c_squared *= safe_factor;
+                            if (c_squared > 0.45) c_squared = 0.45;
+                        }
+
+                        nextU[i] = (2 * u[i] - uPrev[i] + c_squared * laplacian) * DAMPING;
+                    }
+                }
+
+                uPrevRef.current.set(u);
+                uRef.current.set(nextU);
+
+                const probeIdx = Math.floor(probePos.y) * GRID_SIZE + Math.floor(probePos.x);
+                let val = u[probeIdx];
+                if (isNaN(val)) val = 0;
+                scopeDataRef.current.push(val);
+                scopeDataRef.current.shift();
+            };
+
+            const animate = useCallback(() => {
+                if (isRunning) {
+                    step();
+                }
+                drawMain();
+                drawScope();
+                requestRef.current = requestAnimationFrame(animate);
+            }, [isRunning, isNonLinear, probePos]);
+
+            useEffect(() => {
+                requestRef.current = requestAnimationFrame(animate);
+                return () => cancelAnimationFrame(requestRef.current);
+            }, [animate]);
+
+            const drawMain = () => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return;
+
+                const imageData = ctx.createImageData(GRID_SIZE, GRID_SIZE);
+                const data = imageData.data;
+                const u = uRef.current;
+                const walls = wallsRef.current;
+
+                for (let i = 0; i < u.length; i++) {
+                    let val = u[i];
+                    if (isNaN(val)) val = 0;
+
+                    const pixelIndex = i * 4;
+                    if (walls[i] === 1) {
+                        data[pixelIndex] = 255; data[pixelIndex+1] = 255; data[pixelIndex+2] = 255; data[pixelIndex+3] = 255;
+                    } else {
+                        const intensity = Math.min(255, Math.abs(val) * 120);
+                        if (val > 0) {
+                            data[pixelIndex] = intensity; data[pixelIndex+1] = 0; data[pixelIndex+2] = 0;
+                        } else {
+                            data[pixelIndex] = 0; data[pixelIndex+1] = 0; data[pixelIndex+2] = intensity;
+                        }
+                        data[pixelIndex+3] = 255;
+                    }
+                }
+                
+                const pIdx = Math.floor(probePos.y) * GRID_SIZE + Math.floor(probePos.x);
+                const pPixel = pIdx * 4;
+                data[pPixel] = 0; data[pPixel+1] = 255; data[pPixel+2] = 0;
+
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = GRID_SIZE;
+                tempCanvas.height = GRID_SIZE;
+                tempCanvas.getContext('2d').putImageData(imageData, 0, 0);
+
+                ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+                ctx.imageSmoothingEnabled = false;
+                ctx.drawImage(tempCanvas, 0, 0, CANVAS_SIZE, CANVAS_SIZE);
+
+                if (mode === 'source' && !autoSource) {
+                    ctx.strokeStyle = 'rgba(255, 255, 0, 0.5)';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([5, 5]);
+                    ctx.strokeRect(20, 20, CANVAS_SIZE-40, CANVAS_SIZE-40);
+                    ctx.setLineDash([]);
+                }
+            };
+
+            const drawScope = () => {
+                const canvas = scopeRef.current;
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return;
+
+                ctx.fillStyle = '#1e293b'; 
+                ctx.fillRect(0, 0, SCOPE_WIDTH, SCOPE_HEIGHT);
+
+                ctx.strokeStyle = '#4ade80'; 
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                
+                const data = scopeDataRef.current;
+                const stepX = SCOPE_WIDTH / data.length;
+                const centerY = SCOPE_HEIGHT / 2;
+
+                for (let i = 0; i < data.length; i++) {
+                    let val = data[i];
+                    if (isNaN(val)) val = 0;
+                    const y = centerY - val * 20; 
+                    if (i === 0) ctx.moveTo(0, y);
+                    else ctx.lineTo(i * stepX, y);
+                }
+                ctx.stroke();
+                
+                ctx.strokeStyle = '#334155';
+                ctx.beginPath();
+                ctx.moveTo(0, centerY); ctx.lineTo(SCOPE_WIDTH, centerY);
+                ctx.stroke();
+
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '10px sans-serif';
+                ctx.fillText(isNonLinear ? "Nonlinear (Distorted)" : "Linear (Sine)", 10, 15);
+            };
+
+            const handleInteraction = (e) => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const rect = canvas.getBoundingClientRect();
+                const scaleX = GRID_SIZE / rect.width;
+                const scaleY = GRID_SIZE / rect.height;
+                const x = Math.floor((e.clientX - rect.left) * scaleX);
+                const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+                if (x >= 0 && x < GRID_SIZE && y >= 0 && y < GRID_SIZE) {
+                    const idx = y * GRID_SIZE + x;
+                    
+                    if (mode === 'probe') {
+                        setProbePos({x, y});
+                    } else if (mode === 'wall') {
+                        wallsRef.current[idx] = 1;
+                        if (x+1 < GRID_SIZE) wallsRef.current[idx+1] = 1;
+                    } else if (mode === 'source') {
+                        const pulseStrength = 5.0; 
+                        uRef.current[idx] = pulseStrength;
+                        if (x>0) uRef.current[idx-1] = pulseStrength * 0.5;
+                        if (x<GRID_SIZE-1) uRef.current[idx+1] = pulseStrength * 0.5;
+                        if (y>0) uRef.current[idx-GRID_SIZE] = pulseStrength * 0.5;
+                        if (y<GRID_SIZE-1) uRef.current[idx+GRID_SIZE] = pulseStrength * 0.5;
+                    }
+                }
+            };
+
+            return (
+                <div className="flex flex-col md:flex-row gap-6 items-start justify-center p-6 w-full max-w-6xl mx-auto">
+                    
+                    {/* 左侧：主视图 */}
+                    <div className="flex-1 flex flex-col items-center">
+                        <h2 className="text-xl font-bold text-slate-800 mb-3 flex items-center gap-2">
+                            <Activity className="text-blue-600"/>
+                            WLE 声场传播模拟 (TUS Research)
+                        </h2>
+                        
+                        <div className="flex gap-2 mb-3 w-full justify-center">
+                            <button
+                                onClick={() => setMode('source')}
+                                className={`px-3 py-1.5 rounded text-sm font-medium flex items-center gap-2 transition-colors ${mode === 'source' ? 'bg-amber-100 text-amber-700 ring-1 ring-amber-300' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+                            >
+                                <MousePointerClick size={16} /> 
+                                {mode === 'source' ? '点击产生脉冲' : '声源模式'}
+                            </button>
+                            <button
+                                onClick={() => setMode('probe')}
+                                className={`px-3 py-1.5 rounded text-sm font-medium flex items-center gap-2 transition-colors ${mode === 'probe' ? 'bg-green-100 text-green-700 ring-1 ring-green-300' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+                            >
+                                <Activity size={16} /> 移动探头
+                            </button>
+                            <button
+                                onClick={() => setMode('wall')}
+                                className={`px-3 py-1.5 rounded text-sm font-medium flex items-center gap-2 transition-colors ${mode === 'wall' ? 'bg-slate-200 text-slate-800 ring-1 ring-slate-300' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+                            >
+                                <Square size={16} /> 绘制障碍
+                            </button>
+                        </div>
+
+                        <div className="relative cursor-crosshair group">
+                            <canvas
+                            ref={canvasRef}
+                            width={CANVAS_SIZE}
+                            height={CANVAS_SIZE}
+                            className="rounded-lg shadow-lg bg-black border-4 border-slate-700"
+                            onMouseDown={handleInteraction}
+                            onMouseMove={(e) => e.buttons === 1 && handleInteraction(e)}
+                            />
+                            {!autoSource && mode === 'source' && (
+                                <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <span className="bg-black/50 text-white text-sm px-3 py-1 rounded-full">点击任意位置发射脉冲</span>
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="flex gap-4 mt-4 items-center">
+                            <button
+                                onClick={() => setIsRunning(!isRunning)}
+                                className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-700 font-medium"
+                            >
+                                {isRunning ? <><Pause size={18} /> 暂停</> : <><Play size={18} /> 继续</>}
+                            </button>
+                            <button
+                                onClick={resetSimulation}
+                                className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-700 font-medium"
+                            >
+                                <RefreshCw size={18} /> 重置
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* 右侧：分析与设置 */}
+                    <div className="w-full md:w-80 flex flex-col gap-5">
+                        
+                        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                            <h3 className="font-bold text-slate-800 text-sm mb-3 flex items-center gap-2">
+                                <Zap size={18} className="text-amber-500"/>
+                                声源控制
+                            </h3>
+                            <div className="flex items-center justify-between">
+                                <span className="text-sm text-slate-600">自动连续波</span>
+                                <button 
+                                    onClick={() => setAutoSource(!autoSource)}
+                                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${autoSource ? 'bg-amber-500' : 'bg-slate-300'}`}
+                                >
+                                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${autoSource ? 'translate-x-6' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className={`p-5 rounded-xl border-2 transition-all duration-300 ${isNonLinear ? 'border-red-400 bg-red-50' : 'border-blue-200 bg-blue-50'}`}>
+                            <h3 className="font-bold text-lg mb-2 flex items-center gap-2">
+                                <Settings2 size={20} />
+                                方程模式
+                            </h3>
+                            <div className="flex items-center justify-between mb-3">
+                                <span className={`text-sm font-medium ${isNonLinear ? 'text-red-700' : 'text-blue-700'}`}>
+                                    {isNonLinear ? "WLE (非线性)" : "LAPWE (线性)"}
+                                </span>
+                                <button 
+                                    onClick={() => setIsNonLinear(!isNonLinear)}
+                                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${isNonLinear ? 'bg-red-500' : 'bg-slate-300'}`}
+                                >
+                                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${isNonLinear ? 'translate-x-6' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+                            <p className="text-xs text-slate-600 leading-relaxed">
+                                {isNonLinear 
+                                    ? "已开启：声速随压力变化 (c = c0 + βp)。注意：模拟激波形成。"
+                                    : "已开启：线性叠加原理。适合低强度仿真。"}
+                            </p>
+                        </div>
+
+                        <div className="bg-slate-800 rounded-xl p-4 border border-slate-700 shadow-inner">
+                            <h3 className="text-green-400 text-sm font-mono mb-2 flex justify-between">
+                                <span>OSCILLOSCOPE</span>
+                                <span className="text-xs opacity-70">Probe Signal</span>
+                            </h3>
+                            <canvas 
+                                ref={scopeRef}
+                                width={SCOPE_WIDTH}
+                                height={SCOPE_HEIGHT}
+                                className="w-full h-32 bg-slate-900 rounded border border-slate-600"
+                            />
+                            <div className="mt-2 text-xs text-slate-400 font-mono">
+                                {isNonLinear ? "Status: Harmonics Generating..." : "Status: Linear Propagation"}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<WLEVisualizer />);
+    </script>
+</body>
+</html>
